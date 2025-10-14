@@ -1,0 +1,23 @@
+[package]
+name = "vast"
+version = "0.1.0"
+edition = "2024"
+authors = ["Excel <excel.que@egmail.com>"]
+description = "VCF file data organizer and plotter"
+license = "MIT"
+repository = "https://github.com/exfactor711/vast"
+
+[dependencies]
+# Core functionality
+clap = { version = "4.5.49", features = ["derive"] }
+regex = "1.12.2"
+# Faster, Minimal Polars Configuration
+polars = { version = "0.51.0", features = ["csv", "dtype-full"] }
+
+[profile.release]
+opt-level = 3        # Optimize for speed
+lto = true             # Link Time Optimization
+codegen-units = 1      # Better optimization at cost of compile time
+panic = "abort"        # Smaller binary
+strip = true           # Remove debug symbols
+
