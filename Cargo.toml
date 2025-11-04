@@ -10,9 +10,6 @@ repository = "https://github.com/exfactor711/vast"
 [dependencies]
 # Core functionality
 clap = { version = "4.5.49", features = ["derive"] }
-regex = "1.12.2"
-# Faster, Minimal Polars Configuration
-polars = { version = "0.51.0", features = ["csv", "dtype-full"] }
 
 [profile.release]
 opt-level = 3        # Optimize for speed
