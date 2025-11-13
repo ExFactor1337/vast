@@ -1,6 +1,7 @@
 // src/main.rs
 use clap::Parser;
-use vast::{Cli, run};         // Import the structs/functions from src/lib.rs
+use vast::run;
+use vast::Cli;
 
 fn main() {
     // 1. Parse command-line arguments
@@ -14,6 +15,4 @@ fn main() {
         // Exit with a non-zero status code to signal failure
         std::process::exit(1);
     }
-
-    // If run(cli) returns Ok(()), the program finishes successfully (exit code 0).
 }

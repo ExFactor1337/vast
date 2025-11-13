@@ -2,16 +2,21 @@ use std::{path::PathBuf, fs::File};
 use clap::Parser;
 use std::io::{self, BufReader, BufRead, Write};
 use std::collections::{HashSet, HashMap};
+use csv::ReaderBuilder;
+use serde::Deserialize;
+use std::error::Error;
+
 // -----------------------------------------------------------
 // 1. PUBLIC TYPE ALIAS AND STRUCTS
 // -----------------------------------------------------------
+
 // Helper function to convert a standard error into the boxed trait object required by VastResult
-fn box_err<E: std::error::Error + Send + Sync + 'static>(e: E) -> Box<dyn std::error::Error> {
+fn box_err<E: Error + Send + Sync + 'static>(e: E) -> Box<dyn Error> {
     Box::new(e)
 }
 
 // Custom Result type
-pub type VastResult<T> = Result<T, Box<dyn std::error::Error>>;
+pub type VastResult<T> = Result<T, Box<dyn Error>>;
 
 // CLI Argument Struct
 #[derive(Parser, Debug)]
@@ -22,6 +27,65 @@ pub struct Cli {
 
     #[arg(long, default_value_t = false)]
     pub print_dfs: bool,
+
+    /// Reference genome assembly to use for absolute position calculation (hg19 or hg38).
+    #[arg(long, default_value = "hg19", value_parser = ["hg19", "hg38"])]
+    pub genome: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct Chromosome {
+    #[serde(rename = "CHROM")]
+    chrom: String,
+    start: u64,
+    stop: u64,
+    midpoint: u64,
+}
+
+pub enum GenomeBuild {
+    Hg19,
+    Hg38,
+}
+
+// --- 2. Embed TSV Data ---
+
+// Embeds the contents of the files into your program at compile time.
+// Assumes files are in a `data/` directory at the project root.
+const HG19_DATA: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/data/hg19.tsv"));
+const HG38_DATA: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/data/hg38.tsv"));
+
+
+fn parse_genome_data(data_str: &str) -> Result<Vec<Chromosome>, Box<dyn Error>> {
+    let mut reader = ReaderBuilder::new()
+        .delimiter(b'\t') // TSV
+        .trim(csv::Trim::Headers) // Handle any whitespace
+        .from_reader(data_str.as_bytes());
+
+    let mut chromosomes = Vec::new();
+    for result in reader.deserialize() {
+        let record: Chromosome = result?;
+        chromosomes.push(record);
+    }
+    Ok(chromosomes)
+}
+
+
+pub type GenomeMap = HashMap<String, u64>;
+
+fn get_genome_start_map(build: GenomeBuild) -> VastResult<GenomeMap> {
+    let data_str = match build {
+        GenomeBuild::Hg19 => HG19_DATA,
+        GenomeBuild::Hg38 => HG38_DATA,
+    };
+
+    let chromosomes = parse_genome_data(data_str)?;
+
+    // Convert the vector of structs into the HashMap mapping CHROM to its cumulative START coordinate
+    let map = chromosomes.into_iter()
+        .map(|c| (c.chrom, c.start))
+        .collect();
+
+    Ok(map)
 }
 
 /// Holds all parsed content from a VCF file, separating metadata from data.
@@ -61,7 +125,7 @@ pub fn read_and_split_vcf(path: &PathBuf) -> VastResult<VcfContent> {
 
         if line.starts_with("##") {
             if header_complete {
-                // FIX 1: Manually create io::Error and box it
+                // Manually create io::Error and box it
                 let err = io::Error::new(
                     io::ErrorKind::InvalidData,
                     "Found '##' header line after variant data began."
@@ -83,7 +147,7 @@ pub fn read_and_split_vcf(path: &PathBuf) -> VastResult<VcfContent> {
             }
         } else if line.starts_with("#") {
             if header_complete {
-                // FIX 2: Manually create io::Error and box it
+                // Manually create io::Error and box it
                 let err = io::Error::new(
                     io::ErrorKind::InvalidData,
                     "Found second column header line."
@@ -100,7 +164,7 @@ pub fn read_and_split_vcf(path: &PathBuf) -> VastResult<VcfContent> {
     }
     // 3. Simple validation (ensure column header was found)
     if column_header.is_empty() {
-        // FIX 3: Manually create io::Error and box it
+        // Manually create io::Error and box it
         let err = io::Error::new(
             io::ErrorKind::InvalidData,
             "VCF file is missing the required column header line ('#CHROM...')."
@@ -226,26 +290,30 @@ fn split_variant_data(data: &str, pair_delimiter: char, kv_delimiter: char) -> H
 pub type VariantTables = (
     Vec<String>,        // Wide Variant Headers (VPK + Fixed + INFO)
     Vec<Vec<String>>,   // Wide Variant Table Data (INFO)
-    Vec<String>,        // Long Sample Headers (VPK + Sample Name + FORMAT keys)
+    Vec<String>,        // Long Sample Headers (VPK + Sample Name + CHROM + POS + ABS_POS + FORMAT keys)
     Vec<Vec<String>>,   // Long Sample Table Data (FORMAT/Sample)
 );
 
 // A tuple for returning the column headers and the variant table
-pub fn process_variants_to_table(column_header: &str, variants: Vec<String>) -> VastResult<VariantTables> {
+pub fn process_variants_to_table(
+    column_header: &str,
+    variants: Vec<String>,
+    genome_map: &GenomeMap
+) -> VastResult<VariantTables> {
+
     let mut info_data_maps: Vec<HashMap<String, String>> = Vec::new();
     let mut all_info_keys: HashSet<String> = HashSet::new();
-
     let mut all_format_keys: HashSet<String> = HashSet::new();
 
-    // Changed from variant_ids to vpk_indices
     let mut vpk_indices: Vec<String> = Vec::new();
+    let mut abs_pos_indices: Vec<String> = Vec::new();
 
     // Get Sample names and the first 9 fixed column names
     let cols: Vec<&str> = column_header.trim().split('\t').collect();
     // Sample names start at column index 9
     let sample_names: Vec<&str> = cols.get(9..).unwrap_or(&[]).to_vec();
 
-    // --- First Pass: Parse all rows and collect all unique INFO and FORMAT keys ---
+    // --- First Pass: Parse all rows and collect all unique INFO/FORMAT keys and ABS_POS ---
     for (i, variant_line) in variants.iter().enumerate() {
         let fields: Vec<&str> = variant_line.split('\t').collect();
 
@@ -257,11 +325,25 @@ pub fn process_variants_to_table(column_header: &str, variants: Vec<String>) -> 
         // Generate VPK (Variant Primary Key) as a string index
         vpk_indices.push((i + 1).to_string());
 
+        // --- ABSOLUTE POSITION CALCULATION (for both tables) ---
+        let pos: u64 = fields.get(1).unwrap_or(&"0").parse().unwrap_or(0);
+        let chrom_name = fields[0];
+
+        let abs_pos: String = genome_map.get(chrom_name)
+            .map(|&start_coord| {
+                // Calculation: Chromosome Start Coordinate + Position - 1
+                (start_coord + pos - 1).to_string()
+            })
+            // Default to "NA" if the CHROM is not in the loaded map.
+            .unwrap_or_else(|| "NA".to_string());
+
+        abs_pos_indices.push(abs_pos); // Store the calculated abs_pos
+        // --------------------------------------------------------------------------------
+
         // INFO field is at index 7
         if fields.len() > 7 {
             let info_data = fields[7];
 
-            // FIX: If the INFO field is the missing value indicator ('.'), skip parsing it.
             if info_data != "." {
                 let info_map = split_variant_data(info_data, ';', '=');
                 for key in info_map.keys() {
@@ -269,11 +351,9 @@ pub fn process_variants_to_table(column_header: &str, variants: Vec<String>) -> 
                 }
                 info_data_maps.push(info_map);
             } else {
-                // If INFO is '.', push an empty map so no '.' key is generated.
                 info_data_maps.push(HashMap::new());
             }
         } else {
-            // Handle variants without an INFO column (field count too low)
             info_data_maps.push(HashMap::new());
         }
 
@@ -289,9 +369,11 @@ pub fn process_variants_to_table(column_header: &str, variants: Vec<String>) -> 
     }
 
     // --- Second Pass: Build the Wide INFO Table (Variant Level) ---
+    // Includes ABS_POS
     let fixed_headers: Vec<String> = vec!["VPK".to_string(),
                                           "CHROM".to_string(),
                                           "POS".to_string(),
+                                          "ABS_POS".to_string(),
                                           "REF".to_string(),
                                           "ALT".to_string(),
                                           "QUAL".to_string(),
@@ -310,13 +392,14 @@ pub fn process_variants_to_table(column_header: &str, variants: Vec<String>) -> 
 
         // Start the row with fixed columns + VPK
         let mut row: Vec<String> = vec![
-            vpk_indices[i].clone(), // VPK
-            fields[0].to_string(), // CHROM
-            fields[1].to_string(), // POS
-            fields[3].to_string(), // REF
-            fields[4].to_string(), // ALT
-            fields[5].to_string(), // QUAL
-            fields[6].to_string(), // FILTER
+            vpk_indices[i].clone(),       // VPK
+            fields[0].to_string(),        // CHROM
+            fields[1].to_string(),        // POS
+            abs_pos_indices[i].clone(),   // ABS_POS
+            fields[3].to_string(),        // REF
+            fields[4].to_string(),        // ALT
+            fields[5].to_string(),        // QUAL
+            fields[6].to_string(),        // FILTER
         ];
 
         // Append INFO columns, inserting "NA" for missing
@@ -331,8 +414,15 @@ pub fn process_variants_to_table(column_header: &str, variants: Vec<String>) -> 
 
     // --- Third Pass: Build the Long Sample Table (Sample Level) ---
 
-    // Headers for the long table: VPK, SAMPLE_NAME, and all FORMAT keys
-    let mut long_sample_headers: Vec<String> = vec!["VPK".to_string(), "SAMPLE_NAME".to_string()];
+    // FIX: ADD CHROM and POS to the long table headers
+    let mut long_sample_headers: Vec<String> = vec![
+        "VPK".to_string(),
+        "SAMPLE_NAME".to_string(),
+        "CHROM".to_string(),    // NEW
+        "POS".to_string(),      // NEW
+        "ABS_POS".to_string()
+    ];
+
     let format_headers_vec: Vec<String> = {
         let mut v: Vec<String> = all_format_keys.into_iter().collect();
         (&mut v).sort_unstable();
@@ -343,8 +433,6 @@ pub fn process_variants_to_table(column_header: &str, variants: Vec<String>) -> 
     let mut long_sample_table: Vec<Vec<String>> = Vec::new();
 
     // We must re-iterate over the original variants to process samples.
-    // We use the original variant lines from the parameter, which are consumed by `into_iter()`.
-    // Since the first pass also iterated over references `&variants`, the VPK indices are correctly aligned.
     for (var_index, variant_line) in variants.into_iter().enumerate() {
         let fields: Vec<&str> = variant_line.split('\t').collect();
 
@@ -359,9 +447,13 @@ pub fn process_variants_to_table(column_header: &str, variants: Vec<String>) -> 
                 if let Some(sample_data_str) = fields.get(9 + sample_index) {
                     let format_values: Vec<&str> = sample_data_str.split(':').collect();
 
+                    // FIX: Insert CHROM and POS along with ABS_POS
                     let mut row: Vec<String> = vec![
-                        vpk_indices[var_index].clone(), // VPK (Link to wide table)
-                        sample_name.to_string(),        // SAMPLE_NAME
+                        vpk_indices[var_index].clone(),      // VPK (Link to wide table)
+                        sample_name.to_string(),             // SAMPLE_NAME
+                        fields[0].to_string(),               // CHROM
+                        fields[1].to_string(),               // POS
+                        abs_pos_indices[var_index].clone(),  // ABS_POS
                     ];
 
                     // Create a map for easy lookup of this sample's data
@@ -430,7 +522,6 @@ fn write_raw_lines_to_file(
 }
 
 
-//noinspection ALL
 pub fn run(cli: Cli) -> VastResult<()> {
 
     println!("\nStarting processing for file: {}", (&cli.path).display());
@@ -442,6 +533,17 @@ pub fn run(cli: Cli) -> VastResult<()> {
             io::ErrorKind::InvalidInput,
             "Could not extract file stem from path for output file naming."
         )))?;
+
+    // Load Genome Map
+    let genome_build = match cli.genome.as_str() {
+        "hg38" => GenomeBuild::Hg38,
+        // Since we restricted the values in Cli, "hg19" is the only other possibility.
+        _ => GenomeBuild::Hg19,
+    };
+
+    let genome_map = get_genome_start_map(genome_build)?;
+    println!("Loaded cumulative coordinates for {} assembly.", cli.genome);
+
 
     // 2. Read and split the VCF file.
     let vcf_content = read_and_split_vcf(&cli.path)?;
@@ -466,11 +568,12 @@ pub fn run(cli: Cli) -> VastResult<()> {
     let (
         wide_info_headers,      // 0: Wide Variant Headers (VPK + Fixed + INFO)
         wide_info_table,        // 1: Wide Variant Table Data
-        long_sample_headers,    // 2: Long Sample Headers (VPK + Sample Name + FORMAT keys)
+        long_sample_headers,    // 2: Long Sample Headers (VPK + Sample Name + CHROM + POS + ABS_POS + FORMAT keys)
         long_sample_table,      // 3: Long Sample Table Data
     ) = process_variants_to_table(
         &vcf_content.column_header,
-        vcf_content.variants
+        vcf_content.variants,
+        &genome_map
     )?;
 
     // --- Output File Writing ---
@@ -496,24 +599,20 @@ pub fn run(cli: Cli) -> VastResult<()> {
         &filter_table
     )?;
 
-    // --- NEW: VCF Metadata Definitions ---
-
-    // 3. infos -> <vcf name>_infos.tsv (NEW)
+    // VCF Metadata Definitions
+    // 3. infos -> <vcf name>_infos.tsv
     write_table_to_tsv(
         &format!("{}_infos.tsv", file_stem),
         Some(&id_number_type_desc_headers),
         &info_table
     )?;
 
-    // 4. formats -> <vcf name>_formats.tsv (NEW)
+    // 4. formats -> <vcf name>_formats.tsv
     write_table_to_tsv(
         &format!("{}_formats.tsv", file_stem),
         Some(&id_number_type_desc_headers),
         &format_table
     )?;
-
-    // --- End NEW: VCF Metadata Definitions ---
-
 
     // 5. misc (RAW LINES) -> <vcf name>_misc.tsv
     // Writes raw lines, one per row, in a single unnamed column
@@ -630,8 +729,8 @@ pub fn run(cli: Cli) -> VastResult<()> {
 
     // 1. Print all Headers/Columns
     println!("Total Sample Columns: {}", long_sample_headers.len());
-    // Updated header description to reflect VPK
-    println!("Headers (Starting with VPK, SAMPLE_NAME): {}", long_sample_headers.join("\t"));
+    // FIX: Updated header description to reflect the new structure
+    println!("Headers (Starting with VPK, SAMPLE_NAME, CHROM, POS, ABS_POS): {}", long_sample_headers.join("\t"));
     println!("--------------------------------------------------");
 
     // 2. Print the first 5 Rows
