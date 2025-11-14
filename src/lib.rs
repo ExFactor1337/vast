@@ -1,10 +1,7 @@
-use std::{path::PathBuf, fs::File};
+use std::{path::PathBuf, fs::File, error::Error, io::{self, BufReader, BufRead, Write}, collections::{HashSet, HashMap}};
 use clap::Parser;
-use std::io::{self, BufReader, BufRead, Write};
-use std::collections::{HashSet, HashMap};
 use csv::ReaderBuilder;
 use serde::Deserialize;
-use std::error::Error;
 
 // -----------------------------------------------------------
 // 1. PUBLIC TYPE ALIAS AND STRUCTS
@@ -54,7 +51,25 @@ pub enum GenomeBuild {
 const HG19_DATA: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/data/hg19.tsv"));
 const HG38_DATA: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/data/hg38.tsv"));
 
+pub fn write_genome_data_to_tsv(
+    build: &GenomeBuild,
+    filename: &str,
+) -> VastResult<()> {
+    let data_str = match build {
+        GenomeBuild::Hg19 => HG19_DATA,
+        GenomeBuild::Hg38 => HG38_DATA,
+    };
 
+    let mut file = File::create(filename)?;
+    file.write_all(data_str.as_bytes())?;
+
+    println!("-> Successfully wrote raw {} assembly data to {}", match build {
+        GenomeBuild::Hg19 => "hg19",
+        GenomeBuild::Hg38 => "hg38",
+    }, filename);
+
+    Ok(())
+}
 fn parse_genome_data(data_str: &str) -> Result<Vec<Chromosome>, Box<dyn Error>> {
     let mut reader = ReaderBuilder::new()
         .delimiter(b'\t') // TSV
@@ -521,7 +536,6 @@ fn write_raw_lines_to_file(
     Ok(())
 }
 
-
 pub fn run(cli: Cli) -> VastResult<()> {
 
     println!("\nStarting processing for file: {}", (&cli.path).display());
@@ -540,6 +554,9 @@ pub fn run(cli: Cli) -> VastResult<()> {
         // Since we restricted the values in Cli, "hg19" is the only other possibility.
         _ => GenomeBuild::Hg19,
     };
+
+    let genome_data_filename = format!("{}_genome_{}.tsv", file_stem, cli.genome);
+    write_genome_data_to_tsv(&genome_build, &genome_data_filename)?;
 
     let genome_map = get_genome_start_map(genome_build)?;
     println!("Loaded cumulative coordinates for {} assembly.", cli.genome);
@@ -746,7 +763,6 @@ pub fn run(cli: Cli) -> VastResult<()> {
         println!("[... {} more rows not shown]", total_sample_rows - rows_printed);
     }
     println!("Total Genotype Records Processed: {}", total_sample_rows);
-
     println!("\nVCF file successfully read, structured, and saved as TSV files.");
 
     Ok(())
