@@ -2,6 +2,7 @@ use std::{path::PathBuf, fs::File, error::Error, io::{self, BufReader, BufRead, 
 use clap::Parser;
 use csv::ReaderBuilder;
 use serde::Deserialize;
+use flate2::read::GzDecoder;
 
 // -----------------------------------------------------------
 // 1. PUBLIC TYPE ALIAS AND STRUCTS
@@ -96,8 +97,12 @@ fn get_genome_start_map(build: GenomeBuild) -> VastResult<GenomeMap> {
     let chromosomes = parse_genome_data(data_str)?;
 
     // Convert the vector of structs into the HashMap mapping CHROM to its cumulative START coordinate
+    // MODIFICATION: Standardize key by removing "chr" prefix when loading coordinates.
     let map = chromosomes.into_iter()
-        .map(|c| (c.chrom, c.start))
+        .map(|c| {
+            let key = c.chrom.trim_start_matches("chr").to_string();
+            (key, c.start)
+        })
         .collect();
 
     Ok(map)
@@ -120,10 +125,25 @@ pub struct VcfContent {
 }
 
 pub fn read_and_split_vcf(path: &PathBuf) -> VastResult<VcfContent> {
-    // 1. Open the file efficiently
+    // 1. Open the file
     let file = File::open(path)?;
-    let reader = BufReader::new(file);
 
+    // 2. Check extension to determine if it's gzipped
+    let is_gzipped = path.extension()
+        .map_or(false, |ext| ext.to_string_lossy() == "gz");
+
+    // 3. Create a Box<dyn BufRead> that is either a standard BufReader or a Gzip-wrapped reader
+    let reader: Box<dyn BufRead> = if is_gzipped {
+        println!("Detected gzipped VCF (.gz). Decompressing...");
+        // GzDecoder implements Read, which is wrapped by BufReader
+        let decoder = GzDecoder::new(file);
+        Box::new(BufReader::new(decoder))
+    } else {
+        println!("Detected uncompressed VCF. Reading directly...");
+        Box::new(BufReader::new(file))
+    };
+
+    // 4. Proceed with reading lines from the generic BufRead trait object
     let mut contigs = Vec::new();
     let mut filters = Vec::new();
     let mut formats = Vec::new();
@@ -134,8 +154,8 @@ pub fn read_and_split_vcf(path: &PathBuf) -> VastResult<VcfContent> {
 
     let mut header_complete = false;
 
-    // 2. Read and categorize lines
-    for line_result in reader.lines() {
+    // 5. Read and categorize lines
+    for line_result in reader.lines() { // reader is now a Box<dyn BufRead>
         let line = line_result?;
 
         if line.starts_with("##") {
@@ -177,7 +197,7 @@ pub fn read_and_split_vcf(path: &PathBuf) -> VastResult<VcfContent> {
             variants.push(line);
         }
     }
-    // 3. Simple validation (ensure column header was found)
+    // 6. Simple validation (ensure column header was found)
     if column_header.is_empty() {
         // Manually create io::Error and box it
         let err = io::Error::new(
@@ -187,7 +207,7 @@ pub fn read_and_split_vcf(path: &PathBuf) -> VastResult<VcfContent> {
         return Err(box_err(err));
     }
 
-    // 4. Return the structured content
+    // 7. Return the structured content
     Ok(VcfContent {
         contigs,
         filters,
@@ -342,9 +362,12 @@ pub fn process_variants_to_table(
 
         // --- ABSOLUTE POSITION CALCULATION (for both tables) ---
         let pos: u64 = fields.get(1).unwrap_or(&"0").parse().unwrap_or(0);
-        let chrom_name = fields[0];
+        let chrom_name_vcf = fields[0]; // The VCF's original CHROM string
 
-        let abs_pos: String = genome_map.get(chrom_name)
+        // MODIFICATION: Standardize VCF CHROM name for map lookup by removing "chr".
+        let chrom_name_key = chrom_name_vcf.trim_start_matches("chr");
+
+        let abs_pos: String = genome_map.get(chrom_name_key) // Use the standardized key
             .map(|&start_coord| {
                 // Calculation: Chromosome Start Coordinate + Position - 1
                 (start_coord + pos - 1).to_string()
